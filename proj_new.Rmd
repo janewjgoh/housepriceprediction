@@ -1,0 +1,639 @@
+---
+title: "project"
+output: html_document
+date: '2022-11-06'
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list=ls())
+setwd("D:/proj_ames")
+getwd()
+library(tidyverse)
+library(corrplot)
+library(tictoc)
+library(glmnet)
+library(gbm)
+library(car)
+
+```
+
+## 1 import data
+
+```{r }
+train <- read.csv("train.csv") #kaggle train set
+dim(train) #1460 x 81
+
+test <- read.csv("test.csv") #kaggle test set
+dim(test) #1459 x 80
+
+df <- rbind(train[,-c(1,81)],test[,-1]) #combined for data cleaning
+
+```
+
+## 2 Initial Data Exploration
+
+```{r}
+
+summary(df) #high level overview
+
+#####----------0. notes for modeling#####----------
+#remove Id for modeling
+#for selected factors with NA values in test set, need to impute
+
+
+#####----------1. explore outliers#####----------
+#author specified outliers by plotting SalePrice to GrLivArea
+plot(train$SalePrice~train$GrLivArea,xlab="Above Ground Living Area SqFt",ylab="Sale Price",main="Finding Outliers in Training Data")
+train[train$SaleCondition,]
+
+nrow(test[test$GrLivArea>4000,]) #outlier in test set cant remove
+nrow(train[train$GrLivArea>4000,]) #4 outliers, if removed then we'd end up extrapolating in test set; won't remove
+
+
+#####----------2.Identifying data types#####----------
+
+##--1. factors: nominal vs ordinal?##--
+#the author indicated that there are 23 nominal and 23 ordinal categories
+
+#23 nominal
+nomvar <- c("MSSubClass", "MSZoning", "Street", "Alley", "LandContour", "LotConfig", "Neighborhood", "Condition1", "Condition2", "BldgType", "HouseStyle", "RoofStyle", "RoofMatl", "Exterior1st", "Exterior2nd", "MasVnrType", "Foundation", "Heating", "CentralAir", "GarageType", "MiscFeature", "SaleType", "SaleCondition")
+
+
+#23 ordinal
+orvar <- c("LotShape", "Utilities", "LandSlope", "OverallQual",
+"OverallCond", "ExterQual", "ExterCond", "BsmtQual",
+"BsmtCond", "BsmtExposure", "BsmtFinType1", "BsmtFinType2",
+"HeatingQC", "Electrical", "KitchenQual", "Functional",
+"FireplaceQu", "GarageFinish", "GarageQual", "GarageCond",
+"PavedDrive", "PoolQC", "Fence")
+
+
+##--2.Numeric Variables##--
+
+#14 discrete
+disvar <- c("YearBuilt", "YearRemodAdd", "BsmtFullBath", "BsmtHalfBath", "FullBath", "HalfBath", "BedroomAbvGr", "KitchenAbvGr", "TotRmsAbvGrd", "Fireplaces", "GarageYrBlt", "GarageCars", "MoSold", "YrSold")
+
+str(df[,colnames(df) %in% disvar]) #double check
+
+
+#19 continuous
+convar <- c("LotFrontage", "LotArea", "MasVnrArea", "BsmtFinSF1", "BsmtFinSF2", "BsmtUnfSF", "TotalBsmtSF", "X1stFlrSF", "X2ndFlrSF", "LowQualFinSF", "GrLivArea", "GarageArea",  "WoodDeckSF", "OpenPorchSF", "EnclosedPorch", "X3SsnPorch", "ScreenPorch", "PoolArea", "MiscVal")
+
+str(df[,colnames(df) %in% convar]) #double check
+
+
+```
+
+## 3 Data:
+3.2 Data Cleaning: impute missing values, convert chr data types to factors: nominal or ordinal, train/test split
+3.3 EDA
+
+```{r }
+#####-----3.1. data overview#####-----
+summary(df)
+
+#####-----3.2. Data Cleaning#####-----
+##--1. impute Missing Values##--
+sum(is.na(df)) #13965 is a lot of NA values
+sum(!is.na(df))
+13965/(13965+216636)
+
+#1 impute the categorical variables
+#these features used NA to indicate the feature is missing; 
+#replace the "NA" with "NoFe" for no feature
+
+list_withna <- c("Alley","BsmtQual","BsmtCond","BsmtExposure","BsmtFinType1","BsmtFinType2","FireplaceQu","GarageType","GarageFinish","GarageQual","GarageCond","PoolQC","Fence","MiscFeature") 
+
+df[,colnames(df) %in% list_withna][is.na(df[,colnames(df) %in% list_withna])] <- "NoFe" #replace with NoFe for no such feature
+
+
+#2 impute the rest of categorical variables
+#these should not have NA's and we'll go with mode imputation
+list_na <- colnames(df)[apply(df, 2, anyNA) ]
+list_na
+
+catlist <- list_na[list_na %in% nomvar | list_na %in% orvar] 
+catlist
+catlist
+
+for(i in 1:length(catlist)){
+  modechar <- names(which.max(summary(as.factor(df[,catlist[i]]))))
+  df[,catlist[i]][is.na(df[,catlist[i]])] <- modechar
+}
+
+#summary(as.factor(df[,catlist[1]])) #doublecheck
+
+
+#3 impute the continuous variables
+#impute 0 for properties that don't have such features
+#for 0 square footage
+list_na <- colnames(df)[apply(df, 2, anyNA) ]
+list_na #check remaining columns with NA's
+
+list_nofe <- c("LotFrontage","MasVnrArea","BsmtFinSF1","BsmtFinSF2","BsmtUnfSF","TotalBsmtSF","BsmtFullBath","BsmtHalfBath")
+
+df[,colnames(df) %in% list_nofe][is.na(df[,colnames(df) %in% list_nofe])] <- 0
+
+
+#4 dealing with the special cases
+#the garage part is a little different, there are the ones without garages and the ones with garages but no info
+
+#the ones without garages will have built year of 0
+df[is.na(df[,"GarageYrBlt"]),"GarageType"]
+df$GarageYrBlt[is.na(df$GarageYrBlt) & df$GarageType=="NoFe"] <- 0
+
+df$GarageYrBlt[is.na(df$GarageYrBlt) & df$GarageType=="NoFe"] <- 0
+
+#the 2 special garages with unknown garage built dates
+#we'll use mean garageyrbuilt from propertise with 
+#similar garage types and property built year
+mean1910 <- round(mean(df[df$GarageType=="Detchd" & df$YearBuilt==1910,"GarageYrBlt"],na.rm=TRUE),0)
+
+med1923 <- round(mean(df[df$GarageType=="Detchd" & df$YearBuilt==1923,"GarageYrBlt"],na.rm=TRUE),0)
+
+df[is.na(df$GarageYrBlt) & df$YearBuilt==1910 & df$GarageType=="Detchd","GarageYrBlt"] <- mean1910
+
+df[is.na(df$GarageYrBlt) & df$YearBuilt==1923 & df$GarageType=="Detchd","GarageYrBlt"] <- mean1910
+
+#and the one garage that we don't know its capacity
+#we'll also use mean cars and square footage from
+#properties with similar built year and garage type
+meancars <-round(mean(df[df$GarageType=="Detchd" & df$YearBuilt==1923,"GarageCars"],na.rm=TRUE),0)
+meanarea <- round(mean(df[df$GarageType=="Detchd" & df$YearBuilt==1923,"GarageArea"],na.rm=TRUE),0)
+
+df[is.na(df$GarageCars) & df$YearBuilt==1923 & df$GarageType=="Detchd","GarageCars"] <- meancars
+
+df[is.na(df$GarageArea) & df$YearBuilt==1923 & df$GarageType=="Detchd","GarageArea"] <- meanarea
+
+
+#5 check that there are no more missing values
+list_na <- colnames(df)[apply(df, 2, anyNA) ]
+list_na #all clear
+
+
+
+##--2.Convert Data type##--
+
+#1 Nominal variables
+
+df[nomvar] <- lapply(df[nomvar],factor)
+sapply(df[nomvar],class) #double check
+
+
+#2 Ordinal variables
+
+df[orvar] <- lapply(df[orvar],ordered)
+sapply(df[orvar],class) #double check
+
+#correct levels; though with these many corrections we may as well have coded all the columns ourselves
+df <- df %>% mutate(LotShape=recode_factor(LotShape,'1'="Reg",'2'="IR1",'3'="IR2",'4'="IR3",.ordered=TRUE)) %>%
+  mutate(Utilities=recode_factor(Utilities,'1'="NoSeWa",'2'="AllPub",.ordered=TRUE)) %>%
+  mutate(ExterQual=recode_factor(ExterQual,'1'="Po",'2'="Fa",'3'="TA",'4'="Gd",'5'="Ex",.ordered=TRUE)) %>%
+  mutate(ExterCond=recode_factor(ExterCond,'1'="Po",'2'="Fa",'3'="TA",'4'="Gd",'5'="Ex",.ordered=TRUE)) %>%
+  mutate(BsmtQual=recode_factor(BsmtQual,'0'="NoFe",'1'="Po",'2'="Fa",'3'="TA",'4'="Gd",'5'="Ex",.ordered=TRUE)) %>%
+  mutate(BsmtCond=recode_factor(ExterQual,'0'="NoFe",'1'="Po",'2'="Fa",'3'="TA",'4'="Gd",'5'="Ex",.ordered=TRUE)) %>%
+  mutate(BsmtExposure=recode_factor(BsmtExposure,'0'="NoFe",'1'="No",'2'="Mn",'3'="Av",'4'="Gd",.ordered=TRUE)) %>%
+  mutate(BsmtFinType1=recode_factor(BsmtFinType1,'0'="NoFe",'1'="Unf",'2'="LwQ",'3'="Rec",'4'="BLQ",'5'="ALQ",'6'="GLQ",.ordered=TRUE)) %>%
+  mutate(BsmtFinType2=recode_factor(BsmtFinType2,'0'="NoFe",'1'="Unf",'2'="LwQ",'3'="Rec",'4'="BLQ",'5'="ALQ",'6'="GLQ",.ordered=TRUE)) %>%
+  mutate(HeatingQC=recode_factor(HeatingQC,'1'="Po",'2'="Fa",'3'="TA",'4'="Gd",'5'="Ex",.ordered=TRUE)) %>%
+  mutate(Electrical=recode_factor(Electrical,'1'="Mix",'2'="FuseP",'3'="FuseF",'4'=" FuseA",'5'="SBrkr	Standard",.ordered=TRUE)) %>%
+  mutate(KitchenQual=recode_factor(KitchenQual,'1'="Po",'2'="Fa",'3'="TA",'4'="Gd",'5'="Ex",.ordered=TRUE)) %>%
+  mutate(Functional=recode_factor(Functional,'1'="Sal",'2'="Sev",'3'="Maj2",'4'="Maj1",'5'="Mod",'6'="Min2",'7'="Min1",'8'="Typ",.ordered=TRUE)) %>%
+  mutate(FireplaceQu=recode_factor(FireplaceQu,'0'="NoFe",'1'="Po",'2'="Fa",'3'="TA",'4'="Gd",'5'="Ex",.ordered=TRUE)) %>%
+  mutate(GarageFinish=recode_factor(GarageFinish,'0'="NoFe",'1'="Unf",'2'="RFn",'3'="Fin",.ordered=TRUE)) %>%
+  mutate(GarageQual=recode_factor(GarageQual,'0'="NoFe",'1'="Po",'2'="Fa",'3'="TA",'4'="Gd",'5'="Ex",.ordered=TRUE)) %>%
+  mutate(GarageCond=recode_factor(GarageCond,'0'="NoFe",'1'="Po",'2'="Fa",'3'="TA",'4'="Gd",'5'="Ex",.ordered=TRUE)) %>%
+  mutate(PavedDrive=recode_factor(PavedDrive,'1'="N",'2'="P",'3'="Y",.ordered=TRUE)) %>%
+  mutate(PoolQC=recode_factor(PoolQC,'0'="NoFe",'1'="Fa",'2'="TA",'3'="Gd",'4'="Ex",.ordered=TRUE)) %>%
+  mutate(Fence=recode_factor(Fence,'0'="NoFe",'1'="MnWw",'2'="GdWo",'3'="MnPrv",'4'="GdPrv",.ordered=TRUE)) 
+
+str(df[orvar]) #double check coding
+head(df$Fence,10)
+
+##--2.Train/Test Split##--
+
+traindf <- cbind(df[1:nrow(train),],SalePrice=train[,81])
+testdf <- df[-(1:nrow(train)),]
+
+
+dim(traindf) #1460 x 80
+dim(testdf) #1459 x 79
+
+
+#####-----3.3. EDA #####-----
+
+#1 Response variable
+par(mfrow=c(1,1))
+hist(traindf$SalePrice,xlab="Sale Price",main="Histogram of Sale Price") #poisson with long tail
+abline(v=mean(traindf$SalePrice),col="red",lwd=2)
+xp <- mean(traindf$SalePrice)*1.8
+text(x=xp,
+     y=400,
+     paste("Mean= ", round(mean(traindf$SalePrice))),
+     col="red",
+     cex=1)
+
+#plot(traindf$SalePrice~as.factor(traindf$YrSold))
+#abline(h=mean(traindf$SalePrice),col="red",lwd=2)
+
+
+#2. Correlations
+
+#for numerical variables only
+
+ndf <- cbind(traindf[,colnames(traindf) %in% convar|colnames(traindf) %in% disvar],SalePrice=traindf$SalePrice)
+str(ndf)
+
+round(cor(ndf),2) #numbers
+corrplot(cor(ndf),tl.cex = 0.5) #plot
+
+cordf <- as.data.frame(cor(ndf))
+index <-which(abs(cordf)>0.8 & abs(cordf) < 1,arr.ind=T)
+highcordf <- cbind.data.frame(Variable1 = rownames(cordf)[index[,1]],Variable2 = colnames(cordf)[index[,2]])
+highcordf 
+#only 3 pairs of highly correlated variables
+#1stFlrSF vs TotalBsmtSF 0.82, TotRmsAbvGrd vs GrLivArea 0.83, GarageArea vs GarageCars 0.88
+
+
+round(cordf[order(-cordf$SalePrice),],4)["SalePrice"]
+#indicated that sale price is not very highly correlated with other variables, but is highly correlated with above ground square footage, moderately correlated with garage size, basement size, first floor size, numbers of rooms above ground, year built and remodeled. Worth noting that fireplace is lowly correlated with sale price. 
+
+
+#3. Visualize Predictors vs Response Variable
+par(mfrow=c(2,2))
+
+#visualize nominal variables
+for(i in 1:length(nomvar)){
+  plot(traindf$SalePrice~as.factor(train[,nomvar[i]]),xlab=nomvar[i],ylab="Sale Price")
+}
+
+par(mfrow=c(2,2))
+#visualize ordinal variables
+for(i in 1:length(orvar)){
+  plot(traindf$SalePrice~as.factor(train[,orvar[i]]),xlab=orvar[i],ylab="Sale Price")
+}
+
+par(mfrow=c(2,2))
+#visualize discrete variables
+for(i in 1:length(disvar)){
+  plot(traindf$SalePrice~as.factor(train[,disvar[i]]),xlab=disvar[i],ylab="Sale Price")
+}
+
+par(mfrow=c(2,2))
+#visualize continuous variables
+for(i in 1:length(convar)){
+  plot(traindf$SalePrice~train[,convar[i]],xlab=convar[i],ylab="Sale Price")
+}
+
+
+#####-----Explore a specific feature in detail#####-----
+#Explore if being near railroad or positive features make a difference in SalePrice 
+#Condition1 or Condition2 = near/adjacent railroad vs positive features
+rr <- c("RRAn","RRAe","RRNn","RRNe") #railroad
+pf <- c("PosN","PosA") #positive features
+
+train[train$Condition1 %in% pf | train$Condition2 %in% pf,c("Condition1","Condition2")] 
+train[train$Condition1 %in% rr | train$Condition2 %in% rr,c("Condition1","Condition2")] 
+#railroad and positive features are mutually exclusive: there are no properties that are both close to railroad AND positive features
+
+
+#near/adjacent to railroad
+alist <- unique(as.factor(train[train$Condition1 %in% rr | train$Condition2 %in% rr,"Neighborhood"])) #affected neighborhoods
+blist <- train[train$Condition1 %in% rr | train$Condition2 %in% rr,"Id"] #affected properties
+
+train %>% select(Neighborhood,SalePrice) %>% filter(Neighborhood %in% alist) %>% group_by(Neighborhood) %>% summarise(Avg = mean(SalePrice)) #railroad affected neighborhoods sale price
+train %>% select(Id,Neighborhood,SalePrice) %>% filter(Id %in% blist) %>% group_by(Neighborhood) %>% summarise(Avg = mean(SalePrice)) #railroad affected properties sale price
+#being adjacent/near railroad seems to be a mix of results, some properties sold higher than neighborhood avg, some lower, some same
+
+
+#positive features
+plist <- unique(as.factor(train[train$Condition1 %in% pf,"Neighborhood"])) #affected neighborhoods
+qlist <- train[train$Condition1 %in% pf,"Id"]
+train %>% select(Neighborhood,SalePrice) %>% filter(Neighborhood %in% plist) %>% group_by(Neighborhood) %>% summarise(Avg = mean(SalePrice))#positive features affected neighborhoods sale price
+train %>% select(Id,Neighborhood,SalePrice) %>% filter(Id %in% qlist) %>% group_by(Neighborhood) %>% summarise(Avg = mean(SalePrice)) #positive features affected properties sale price
+#this is a straightforward difference, all properties with positive features command higher average sale price 
+
+#code used to check saleprice differences in factors
+#train %>% group_by(Utilities) %>% summarise(Med=median(SalePrice))
+#train %>% group_by(Utilities) %>% summarise(Avg=mean(SalePrice))
+#summary(as.factor(train$Utilities))
+#summary(as.factor(test$Utilities))
+
+```
+
+
+## 4 Model training & training error
+
+4 methods are attempted:
+1.	linear regression with all parameters: no tuning
+2.	lasso regression: alpha=1, 10 folds cross validation
+3.	stepwise regression
+4.	boosting (gbm): 3 parameters tuned- ntrees, mtry, and nodesize
+
+
+```{r }
+##----------0. preparations ##----------
+#prepare data
+xtr <- model.matrix(~ ., data=traindf[,-80], contrasts.arg = sapply(traindf[,-80], is.factor))
+ytr <- traindf[,80]
+
+#calculate rmse (kaggle competition measure)
+rmse <- function(x,y){
+  a <- sqrt(sum((log(x)-log(y))^2)/length(y))
+  return(a)
+}
+        
+##----------1. full model linear regression ##----------
+
+tic("fullmod")
+set.seed(7406)
+fullmod <- lm(SalePrice~., data=traindf)
+toc() #0.65 sec
+
+summary(fullmod) #adjusted R2 0.9239
+data.frame(coef(fullmod))
+
+
+##----------2. lasso regression ##----------
+set.seed(7406)
+tic("lasso")
+lrcv <- cv.glmnet(xtr, ytr, alpha=1, nfolds=10) 
+toc() #2.11 sec
+
+set.seed(7406)
+lrmod <- glmnet(xtr, ytr, alpha=1, nlambda = 100)
+
+
+par(mfrow=c(1,1))
+plot(lrmod,xvar="lambda", lwd=2) #plot
+abline(v=log(lrcv$lambda.min), col='black', lty=2) #optimal lambda
+
+lassoCoeffs <- coef(lrmod, s=lrcv$lambda.min)
+length(lassoCoeffs[lassoCoeffs!=0]) #69 coefs
+lassoCoeffs
+
+##----------3. Backward Stepwise  ##----------
+
+minimum <- lm(SalePrice~1, data=traindf)
+set.seed(7406)
+tic("stepwise")
+stepmod <- step(fullmod,scope=list(lower=minimum,upper=fullmod),direction="backward",trace=FALSE)
+toc() #147.48 sec
+
+summary(stepmod) #42 variables
+
+
+##----------4. Boosting ##----------
+#parameters tuning
+ntrees <- c(50,100,500,1000)
+shrink <- c(0.01,0.05,0.1) 
+idepth <- c(1,2,3,4,5)
+boostres <- NULL
+
+set.seed(7406)
+tic("gbm")
+for(i in 1:length(ntrees)){
+  for (j in 1:length(shrink)){
+    for (k in 1:length(idepth)){
+      gbmod <- gbm(SalePrice ~ .,data=traindf,
+                   distribution="gaussian",
+                   n.trees = ntrees[i], 
+                   shrinkage = shrink[j], 
+                   interaction.depth = idepth[k],
+                   cv.folds = 10)
+      perf_gbm1 = gbm.perf(gbmod, method="cv")
+    pred <- predict(gbmod,newdata = traindf[,-80], n.trees=perf_gbm1)
+    rms <- rmse(ytr,pred)
+    boostres <- rbind(boostres,c(i,j,k,rms))
+    }
+  }
+}
+toc() #1013.86 sec ~17min
+
+boostres
+
+#select best parameters that minimizes rmse 
+bdf <- as.data.frame(boostres)
+colnames(bdf) <- c("ntrees","shrink","idepth","rmse")
+bdf
+bparams <- bdf[which.min(bdf$rmse),] 
+bparams
+
+#train boosting model using best parameters 
+set.seed(7406)
+tic(gbm)
+gbmod <- gbm(SalePrice ~ ., data=traindf, 
+             distribution="gaussian",
+             n.trees = ntrees[bparams[[1]]], 
+             shrinkage = shrink[bparams[[2]]], 
+             interaction.depth = idepth[bparams[[3]]],
+             cv.folds = 10)
+toc() #35.17 sec
+
+par(mfrow=c(1,1))
+summary(gbmod) #which variances are important
+perf_gbm1 = gbm.perf(gbmod, method="cv") 
+perf_gbm1 #estimated optimal number of iterations 511
+
+
+
+##---------- 5. calculate rmse ##----------
+pred1 <- predict(fullmod, traindf[,-80], interval='prediction')
+pred2 <- predict(lrmod, xtr, type="response", s=lrcv$lambda.min)
+pred3 <- predict(stepmod,traindf[,-80], type="response") 
+pred4 <- predict(gbmod, traindf[,-80], n.trees=perf_gbm1, type="response")
+
+cc <- (0.1*pred1[,1])+(0.1*pred2)+(0.1*pred3)+(0.7*pred4)
+rmse(ytr,cc)
+
+
+
+trainerror <- NULL
+trainerror <- cbind(trainerror, rmse(ytr,pred1[,1]));
+trainerror <- cbind(trainerror, rmse(ytr,pred2));
+trainerror <- cbind(trainerror, rmse(ytr,pred3));
+trainerror <- cbind(trainerror, rmse(ytr,pred4));
+
+#display result
+trainerror <- as.data.frame(trainerror)
+colnames(trainerror) <- c("Linear Regression","Lasso", "Stepwise","GBM")
+trainerror
+
+##---------- 6. Model assumptions checking and hypothesis testing ##---------- 
+##--1.linear regression assumptions checking ##-- 
+par(mfrow =c(2,2))
+
+#1.1 full model assumptions checking
+#linearity
+resids = rstandard(fullmod)
+
+for(i in 1:length(convar)){
+  plot(traindf[,convar[i]], resids, xlab=convar[i],ylab="Residuals")
+  abline(0,0,col="red")
+}
+
+#uncorrelated errors
+par(mfrow =c(2,2))
+fits = fullmod$fitted
+plot(fits, resids, xlab="Fitted Values",ylab="Residuals")
+abline(0,0,col="red")
+
+#normality
+qqPlot(resids, ylab="Residuals", main = "")
+hist(resids, xlab="Residuals", main = "",nclass=10,col="orange")
+
+#outliers
+cook = cooks.distance(fullmod)
+plot(cook,type="h",lwd=3,col="red", ylab = "Cook's Distance")
+which(cook>1) #1171,1424
+
+bc = boxCox(fullmod) #boxcox transformation for normality
+lambda = bc$x[which(bc$y==max(bc$y))]
+cat("Optimal lambda:", lambda) #
+
+#1.2 build new linear regression model with boxcox transformed Y,
+#      data removed outliers, and recheck assumptions
+model1 <- lm(log(SalePrice)~.,data=traindf[-c(1171,1424),])
+
+#linearity
+resids1 = rstandard(model1)
+par(mfrow=c(2,2))
+for(i in 1:length(convar)){
+  plot(traindf[-c(1171,1424),convar[i]], resids1, xlab=convar[i],ylab="Residuals")
+  abline(0,0,col="red")
+}
+
+#uncorrelated errors
+par(mfrow =c(2,2))
+fits1 = model1$fitted
+plot(fits1, resids1, xlab="Fitted Values",ylab="Residuals")
+abline(0,0,col="red")
+
+#normality
+qqPlot(resids1, ylab="Residuals", main = "")
+hist(resids1, xlab="Residuals", main = "",nclass=10,col="orange")
+
+#outliers
+cook1 = cooks.distance(model1)
+plot(cook1,type="h",lwd=3,col="red", ylab = "Cook's Distance")
+
+#boxcox did not help with normality
+
+
+##--2. lasso + lm model assumptions ##-- 
+#       and predictors significance  
+
+#2.1 build regression model using variables selected by lasso  
+model2 <- lm(SalePrice~BsmtFinType1+LotConfig+BsmtFullBath+Functional+Fireplaces+MSZoning+HouseStyle+Condition2+RoofStyle+HeatingQC+LowQualFinSF+BldgType+KitchenAbvGr+Heating+BsmtCond+PoolQC, data=traindf)
+summary(model2) #adj r2 0.6722
+
+#2.2 assumptions testing
+par(mfrow =c(2,2))
+
+#linearity
+resids2 = rstandard(model2)
+
+for(i in 1:length(convar)){
+  plot(train[,convar[i]], resids2, xlab=convar[i],ylab="Residuals")
+  abline(0,0,col="red")
+}
+
+#uncorrelated errors
+par(mfrow =c(2,2))
+fits2 = model2$fitted
+plot(fits2, resids2, xlab="Fitted Values",ylab="Residuals")
+abline(0,0,col="red")
+
+#normality
+qqPlot(resids2, ylab="Residuals", main = "")
+hist(resids2, xlab="Residuals", main = "",nclass=10,col="orange")
+
+#outliers
+cook2 = cooks.distance(model2)
+plot(cook2,type="h",lwd=3,col="red", ylab = "Cook's Distance")
+which(cook2>1) #667
+
+#2.3 Testing subset of coefficients
+#h_0: additional predictors (those not selected by lasso) = 0 (i.e. the excluded predictors are insignificant)
+#h_a: additional predictors != 0 for at least one of the predictors (i.e. at least one of the excluded predictors is significantly associated with SalePrice)
+
+anova(model2,fullmod) #f-stat 22.695 p-val < 2.2e-16
+#reject null hypothesis; at least one of the excluded predictors is significantly associated with SalePrice
+
+
+##-- 3. stepwise + lm model assumptions##-- 
+#        and predictors significance           
+
+#3.1 build linear regression model using variables selected by stepwise
+model3 <- lm(SalePrice~OverallQual+Neighborhood+BsmtFinSF1+GarageCars+X1stFlrSF+LotArea+X2ndFlrSF+MasVnrArea+GarageArea+KitchenQual+SaleCondition+BsmtExposure+YearRemodAdd+TotRmsAbvGrd+OverallCond+Exterior1st+BsmtQual+YearBuilt+BedroomAbvGr+GarageYrBlt+RoofMatl+Condition1+FullBath+MoSold+ScreenPorch+LandContour+LotConfig+BsmtFullBath+Functional+Fireplaces+MSZoning+Condition2+RoofStyle+BsmtFinSF2+LandSlope+X3SsnPorch+BldgType+KitchenAbvGr+Street+PoolArea+PoolQC, data=traindf)
+summary(model3) #adj r2 0.9235
+
+#3.2 assumptions testing
+par(mfrow =c(2,2))
+
+#linearity
+resids3 = rstandard(model3)
+
+for(i in 1:length(convar)){
+  plot(train[,convar[i]], resids3, xlab=convar[i],ylab="Residuals")
+  abline(0,0,col="red")
+}
+
+#uncorrelated errors
+par(mfrow =c(2,2))
+fits3 = model3$fitted
+plot(fits3, resids3, xlab="Fitted Values",ylab="Residuals")
+abline(0,0,col="red")
+
+#normality
+qqPlot(resids3, ylab="Residuals", main = "")
+hist(resids3, xlab="Residuals", main = "",nclass=10,col="orange")
+
+#outliers
+cook3 = cooks.distance(model3)
+plot(cook3,type="h",lwd=3,col="red", ylab = "Cook's Distance")
+which(cook3>1) #524, 826
+
+#3.3 Testing subset of coefficients
+
+anova(model3,fullmod) #f-stat 1.0546 p-val 0.3288
+#cannot reject null hypothesis; conclude that the reduced model is plausibly as good in terms of explanatory power as the full model
+
+
+
+```
+
+## 5 Testing Data Prediction
+
+```{r }
+##----------0. prepare testing data ##----------
+
+xte <- model.matrix(~ ., data=testdf, contrasts.arg = sapply(testdf, is.factor))
+
+#there is a problem in MSSubClass where there is an observation with level not in train data; there would be extrapolation problem for linear regression so changing the value to 160 for that model
+summary(testdf$MSSubClass)
+specdf <- data.frame(testdf)
+specdf[specdf$MSSubClass==150,"MSSubClass"] <- 160
+specdf[specdf$MSSubClass==150,"MSSubClass"]
+
+
+##----------1. Predictions##----------
+pred1test <- predict(fullmod, specdf, interval='prediction')
+pred2test <- predict(lrmod, xte, type="response", s=lrcv$lambda.min)
+pred3test <- predict(stepmod,testdf, type="response") 
+pred4test <- predict(gbmod, testdf, n.trees=perf_gbm1, type="response")
+
+
+##----------2. Export & upload to Kaggle##----------
+
+write.csv(data.frame(pred1test[,1]),"D:\\proj_ames\\pred1_3.csv",row.names=TRUE) #0.18975;
+write.csv(data.frame(pred2test),"D:\\proj_ames\\pred2_3.csv",row.names=TRUE) #0.14575;
+write.csv(data.frame(pred3test),"D:\\proj_ames\\pred3_3.csv",row.names=TRUE) #0.17058;
+write.csv(data.frame(pred4test),"D:\\proj_ames\\pred4_4.csv",row.names=TRUE) #0.13157;
+
+
+```
